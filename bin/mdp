@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""
+mdp - Markdown preview in terminal with less-like interaction.
+
+A zero-dependency Python 3 script for macOS/*nix terminals. Renders a practical
+subset of Markdown to ANSI and automatically opens long output in `less -R`.
+
+Usage:
+    mdp file.md          # preview file.md
+    mdp                  # read from stdin
+    cat file.md | mdp
+    mdp -p file.md       # always use pager
+    mdp -c file.md       # disable colors
+"""
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import unicodedata
+from typing import List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# ANSI styles
+# ---------------------------------------------------------------------------
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+STYLES = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "italic": "\033[3m",
+    "underline": "\033[4m",
+    "gray": "\033[90m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "white": "\033[37m",
+    "dark_gray": "\033[38;5;240m",
+    "orange": "\033[38;5;208m",
+    "quote_bar": "\033[38;5;240m",
+    "hr": "\033[38;5;240m",
+}
+
+HEADING_STYLE = {
+    1: STYLES["bold"] + STYLES["magenta"] + STYLES["underline"],
+    2: STYLES["bold"] + STYLES["cyan"],
+    3: STYLES["bold"] + STYLES["green"],
+    4: STYLES["bold"] + STYLES["yellow"],
+    5: STYLES["bold"] + STYLES["dark_gray"],
+    6: STYLES["bold"] + STYLES["gray"],
+}
+
+# image, link, triple-backtick code, single-backtick code, bold+italic, bold, italic
+INLINE_RE = re.compile(
+    r"(!\[([^\]]*)\]\(([^)]+)\))"
+    r"|(\[([^\]]*)\]\(([^)]+)\))"
+    r"|(```([^`]*)```)"
+    r"|(`([^`]+)`)"
+    r"|(\*\*\*(.*?)\*\*\*)"
+    r"|(\*\*(.*?)\*\*)"
+    r"|(\*(.*?)\*)"
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def visual_width(text: str) -> int:
+    """Display width ignoring ANSI escape sequences and respecting CJK width."""
+    width = 0
+    for ch in ANSI_RE.sub("", text):
+        ea = unicodedata.east_asian_width(ch)
+        if ea in ("F", "W"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def apply_style(word: str, style_name: str) -> str:
+    if not style_name:
+        return word
+    if style_name == "bold":
+        return STYLES["bold"] + word + STYLES["reset"]
+    if style_name == "italic":
+        return STYLES["italic"] + word + STYLES["reset"]
+    if style_name == "bold_italic":
+        return STYLES["bold"] + STYLES["italic"] + word + STYLES["reset"]
+    if style_name == "code_inline":
+        return STYLES["cyan"] + word + STYLES["reset"]
+    if style_name == "code_block":
+        return STYLES["green"] + word + STYLES["reset"]
+    if style_name == "link":
+        return STYLES["blue"] + STYLES["underline"] + word + STYLES["reset"]
+    if style_name == "image":
+        return STYLES["cyan"] + word + STYLES["reset"]
+    if style_name.startswith("h") and style_name[1:].isdigit():
+        return HEADING_STYLE[int(style_name[1])] + word + STYLES["reset"]
+    return word
+
+
+def char_width(ch: str) -> int:
+    """Display width of a single character."""
+    ea = unicodedata.east_asian_width(ch)
+    return 2 if ea in ("F", "W") else 1
+
+
+def render_inline(text: str) -> str:
+    """Render inline Markdown markup to an ANSI string, preserving all other characters."""
+    result: List[str] = []
+    pos = 0
+    for m in INLINE_RE.finditer(text):
+        if m.start() > pos:
+            result.append(text[pos : m.start()])
+        if m.group(1):  # image
+            result.append(apply_style(f"[图片] {m.group(2)} ({m.group(3)})", "image"))
+        elif m.group(4):  # link
+            result.append(apply_style(f"{m.group(5)} ({m.group(6)})", "link"))
+        elif m.group(7) or m.group(9):  # code
+            code = m.group(8) or m.group(10)
+            result.append(apply_style(code, "code_inline"))
+        elif m.group(11):  # bold+italic
+            result.append(apply_style(m.group(12), "bold_italic"))
+        elif m.group(13):  # bold
+            result.append(apply_style(m.group(14), "bold"))
+        elif m.group(15):  # italic
+            result.append(apply_style(m.group(16), "italic"))
+        pos = m.end()
+    if pos < len(text):
+        result.append(text[pos:])
+    return "".join(result)
+
+
+def wrap_text(text: str, width: int, indent: int = 0, prefix: str = "") -> List[str]:
+    """
+    Wrap a string that may contain ANSI escape sequences.
+
+    - Preserves all spaces from the input.
+    - Breaks lines at the display-width boundary (character level).
+    """
+    prefix_str = " " * indent + prefix
+    available = max(1, width - visual_width(prefix_str))
+
+    lines: List[str] = []
+    current = ""
+    current_width = 0
+    active_codes: List[str] = []
+
+    i = 0
+    n = len(text)
+    while i < n:
+        # ANSI escape sequence: pass through and track active style codes
+        if text[i] == "\033":
+            m = ANSI_RE.match(text, i)
+            if m:
+                code = m.group(0)
+                current += code
+                if code == "\033[0m":
+                    active_codes = []
+                else:
+                    active_codes.append(code)
+                i = m.end()
+                continue
+
+        ch = text[i]
+        cw = char_width(ch)
+
+        # If adding this character would overflow and we already have content,
+        # flush the current line first.
+        if current_width + cw > available and current:
+            lines.append(prefix_str + current)
+            current = "".join(active_codes)
+            current_width = 0
+            continue
+
+        current += ch
+        current_width += cw
+        i += 1
+
+    if current:
+        lines.append(prefix_str + current)
+
+    if not lines:
+        lines.append(prefix_str)
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Block renderers
+# ---------------------------------------------------------------------------
+def render_heading(line: str, width: int) -> List[str]:
+    m = re.match(r"^(#{1,6})\s+(.*)$", line.strip())
+    if not m:
+        return render_paragraph([line], width)
+    level = len(m.group(1))
+    text = m.group(2).strip()
+    rendered = render_inline(text)
+    styled = apply_style(rendered, f"h{level}")
+    out = wrap_text(styled, width)
+    if level == 1 and out:
+        title_width = visual_width(out[0])
+        out.append(STYLES["hr"] + "─" * min(title_width, width) + STYLES["reset"])
+    return out
+
+
+def render_paragraph(lines: List[str], width: int) -> List[str]:
+    text = " ".join(l.strip() for l in lines)
+    rendered = render_inline(text)
+    return wrap_text(rendered, width)
+
+
+def render_list(items: List[Tuple[int, Optional[str], Optional[str], str]], width: int) -> List[str]:
+    out: List[str] = []
+    for _indent, bullet_sym, num, content in items:
+        indent = min(_indent, width // 4)
+        task_m = re.match(r"^\[([ xX])\]\s*(.*)$", content)
+        if task_m:
+            checkbox = "☑" if task_m.group(1).lower() == "x" else "☐"
+            prefix = checkbox + " "
+            rendered = render_inline(task_m.group(2))
+        else:
+            prefix = (f"{num}." if num else "•") + " "
+            rendered = render_inline(content)
+        out.extend(wrap_text(rendered, width, indent=indent, prefix=prefix))
+    return out
+
+
+def render_quote(lines: List[str], width: int) -> List[str]:
+    text = " ".join(l.lstrip().lstrip(">").strip() for l in lines)
+    rendered = render_inline(text)
+    wrapped = wrap_text(rendered, max(1, width - 2))
+    bar = STYLES["quote_bar"] + "│" + STYLES["reset"]
+    return [f"{bar} {l}" for l in wrapped]
+
+
+def render_code_block(lines: List[str], width: int, lang: str) -> List[str]:
+    out: List[str] = []
+    bar = STYLES["quote_bar"] + "│" + STYLES["reset"]
+    if lang:
+        out.append(f"{bar} {STYLES['gray']}{lang}{STYLES['reset']}")
+    for raw in lines:
+        styled = apply_style(raw, "code_block")
+        out.append(f"{bar} {styled}")
+    return out
+
+
+def render_table(lines: List[str], _width: int) -> List[str]:
+    out: List[str] = []
+    for line in lines:
+        if re.match(r"^\s*\|?[\s:\-|]+\|?\s*$", line):
+            continue
+        cells = [c.strip() for c in line.split("|")]
+        cells = [c for c in cells if c]
+        rendered = " | ".join(cells)
+        out.append(STYLES["gray"] + rendered + STYLES["reset"])
+    return out
+
+
+def render_hr(width: int) -> List[str]:
+    return [STYLES["hr"] + "─" * width + STYLES["reset"]]
+
+
+def is_block_start(line: str) -> bool:
+    if line.lstrip().startswith("```"):
+        return True
+    if re.match(r"^#{1,6}\s", line):
+        return True
+    if re.match(r"^(\s*)(?:[-*+]|\d+\.)\s", line):
+        return True
+    if line.lstrip().startswith(">"):
+        return True
+    if "|" in line:
+        return True
+    if re.match(r"^(\s*[-*_]){3,}\s*$", line):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Main parser
+# ---------------------------------------------------------------------------
+def render_markdown(text: str, width: int) -> List[str]:
+    lines = text.splitlines()
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+
+        # fenced code block
+        if line.lstrip().startswith("```"):
+            lang = line.lstrip()[3:].strip()
+            i += 1
+            content: List[str] = []
+            while i < n and not lines[i].lstrip().startswith("```"):
+                content.append(lines[i])
+                i += 1
+            i += 1  # skip closing fence
+            out.extend(render_code_block(content, width, lang))
+            continue
+
+        # horizontal rule
+        if re.match(r"^(\s*[-*_]){3,}\s*$", line):
+            out.extend(render_hr(width))
+            i += 1
+            continue
+
+        # heading
+        if re.match(r"^#{1,6}\s", line):
+            out.extend(render_heading(line, width))
+            i += 1
+            continue
+
+        # list
+        if re.match(r"^(\s*)(?:[-*+]|\d+\.)\s", line):
+            items: List[Tuple[int, Optional[str], Optional[str], str]] = []
+            while i < n and re.match(r"^(\s*)(?:[-*+]|\d+\.)\s", lines[i]):
+                m = re.match(r"^(\s*)(?:([-*+])|(\d+)\.)\s+(.*)$", lines[i])
+                if m:
+                    items.append((len(m.group(1)), m.group(2), m.group(3), m.group(4)))
+                i += 1
+            out.extend(render_list(items, width))
+            continue
+
+        # blockquote
+        if line.lstrip().startswith(">"):
+            qlines: List[str] = []
+            while i < n and lines[i].lstrip().startswith(">"):
+                qlines.append(lines[i])
+                i += 1
+            out.extend(render_quote(qlines, width))
+            continue
+
+        # table
+        if "|" in line:
+            tlines: List[str] = []
+            while i < n and "|" in lines[i]:
+                tlines.append(lines[i])
+                i += 1
+            out.extend(render_table(tlines, width))
+            continue
+
+        # blank line
+        if line.strip() == "":
+            out.append("")
+            i += 1
+            continue
+
+        # paragraph
+        plines = [line]
+        i += 1
+        while (
+            i < n
+            and lines[i].strip() != ""
+            and not is_block_start(lines[i])
+        ):
+            plines.append(lines[i])
+            i += 1
+        out.extend(render_paragraph(plines, width))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+def display(lines: List[str], force_pager: bool, no_color: bool) -> None:
+    color_ok = not no_color and sys.stdout.isatty()
+    output_lines = lines if color_ok else [strip_ansi(l) for l in lines]
+
+    term_h = shutil.get_terminal_size().lines if sys.stdout.isatty() else 0
+    use_pager = force_pager or (
+        sys.stdout.isatty() and term_h > 0 and len(output_lines) > term_h - 1
+    )
+
+    if use_pager:
+        pager = os.environ.get("PAGER", "less -R")
+        cmd = shlex.split(pager)
+        if not cmd:
+            cmd = ["less", "-R"]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
+            try:
+                for rendered in output_lines:
+                    proc.stdin.write(rendered + "\n")
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            proc.wait()
+            return
+        except FileNotFoundError:
+            pass
+
+    for rendered in output_lines:
+        print(rendered)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Preview Markdown in terminal with less-like interaction."
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        default="-",
+        help="Markdown file to preview (default: read from stdin)",
+    )
+    parser.add_argument(
+        "-p",
+        "--pager",
+        action="store_true",
+        help="Always open output in the pager",
+    )
+    parser.add_argument(
+        "-c",
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI colors",
+    )
+    args = parser.parse_args()
+
+    if args.file == "-":
+        text = sys.stdin.read()
+    else:
+        try:
+            with open(args.file, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as exc:
+            print(f"mdp: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    width = shutil.get_terminal_size().columns if sys.stdout.isatty() else 80
+    rendered = render_markdown(text, width)
+    display(rendered, args.pager, args.no_color)
+
+
+if __name__ == "__main__":
+    main()
